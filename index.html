@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>말랑이 · Hand Landmarker</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo+Expanded:wght@500&display=swap" />
+  <!--
+    MediaPipe Hand landmarks detection guide의 Hand Landmarker를 사용합니다.
+    16:9 화면 전체가 웹캠이고, 정가운데 하얀 말랑이를 움켜쥐면
+    손 랜드마크의 악력에 따라 모양이 눌립니다.
+
+    python3 -m http.server 4173
+    브라우저에서 http://localhost:4173 을 여세요.
+  -->
+  <style>
+    @font-face {
+      font-family: "NanumSquareOTF_ac";
+      src: url("https://cdn.jsdelivr.net/npm/@kfonts/nanum-square-ac-otf@0.2.0/NanumSquareOTF_acR.woff2") format("woff2");
+      font-weight: 400;
+      font-display: swap;
+    }
+
+    @font-face {
+      font-family: "NanumSquareOTF_ac";
+      src: url("https://cdn.jsdelivr.net/npm/@kfonts/nanum-square-ac-otf@0.2.0/NanumSquareOTF_acB.woff2") format("woff2");
+      font-weight: 700;
+      font-display: swap;
+    }
+
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: #000;
+      overflow: hidden;
+      overscroll-behavior: none;
+    }
+
+    .stage {
+      position: fixed;
+      inset: 0;
+      width: 100vw;
+      height: 100vh;
+      height: 100dvh;
+      background: #000;
+      overflow: hidden;
+    }
+
+    video,
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    video {
+      object-fit: cover;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    canvas {
+      z-index: 1;
+    }
+
+    .status,
+    .caption {
+      position: absolute;
+      z-index: 2;
+      left: 50%;
+      margin: 0;
+      transform: translateX(-50%);
+      color: #fff;
+      text-align: center;
+      pointer-events: none;
+    }
+
+    .status {
+      top: 12%;
+      max-width: 84%;
+      padding: 0.45rem 0.9rem;
+      border-radius: 999px;
+      background: rgba(0, 0, 0, 0.55);
+      font-family: Pretendard, system-ui, sans-serif;
+      font-weight: 500;
+      font-size: clamp(13px, 1.5vw, 17px);
+      line-height: 1.45;
+    }
+
+    .status.is-hidden {
+      display: none;
+    }
+
+    .caption {
+      bottom: 16px;
+      width: max-content;
+      max-width: calc(100% - 32px);
+      color: #fff;
+      font-family: Pretendard, system-ui, sans-serif;
+      font-weight: 500;
+      font-size: clamp(13px, 1.45vw, 20px);
+      letter-spacing: -0.03em;
+      line-height: 1.3;
+      text-shadow: none;
+      white-space: nowrap;
+    }
+
+    .arrow {
+      position: absolute;
+      z-index: 3;
+      top: 50%;
+      width: 52px;
+      height: 88px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: #fff;
+      transform: translateY(-50%);
+      cursor: pointer;
+    }
+
+    .arrow-prev {
+      left: 7%;
+    }
+
+    .arrow-next {
+      right: 7%;
+    }
+
+    .arrow svg {
+      display: block;
+      width: 34px;
+      height: 34px;
+      margin: 0 auto;
+    }
+
+    .arrow:hover {
+      opacity: 0.72;
+    }
+
+    .arrow:active,
+    .arrow.is-touched {
+      opacity: 0.48;
+    }
+  </style>
+</head>
+<body>
+  <main class="stage" id="stage">
+    <video id="webcam" playsinline autoplay muted></video>
+    <canvas id="view"></canvas>
+    <button class="arrow arrow-prev" id="prev-squishy" type="button" aria-label="이전 말랑이">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M14.8 4.6 7.2 12l7.6 7.4" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+    <button class="arrow arrow-next" id="next-squishy" type="button" aria-label="다음 말랑이">
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9.2 4.6 16.8 12 9.2 19.4" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </button>
+    <p class="status" id="status" role="status">손 랜드마크 모델을 준비하는 중…</p>
+    <p class="caption">화면에 손바닥을 비춘 뒤, 말랑이를 꾹꾹 만져보세요.</p>
+  </main>
+
+  <script type="module">
+    import {
+      FilesetResolver,
+      HandLandmarker,
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0";
+
+    const WASM_ROOT = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.2.0/wasm";
+    const MODEL_URL =
+      "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+    const POINT_COUNT = 96;
+    const SQUISHY_COUNT = 22;
+    const KO_FONT = "NanumSquareOTF_ac";
+    const EN_FONT = '"Archivo Expanded"';
+    const DEFENSES = [
+      {
+        ko: "승화", en: "Sublimation", mature: true,
+        lines: [
+          ["승화는 사회적으로 용납되지 않는 충동이나 욕구를 건설적이고 가치 있는", "활동으로 전환하는 방어기제입니다. 가장 성숙하고 건강한 방어기제로 꼽힙니다."],
+          ["예를 들어, 공격적인 충동을 권투나 격투기 같은 스포츠로 표출하거나, 성적 에너지를 예술 창작", "활동으로 승화시키는 것이 해당됩니다. 분노를 느낄 때 청소를 하거나 글을 쓰는 것도 승화의 일종입니다."],
+        ],
+      },
+      {
+        ko: "유머", en: "Humor", mature: true,
+        lines: [
+          ["유머는 스트레스 상황이나 불편한 감정을 웃음으로 전환해 심리적 긴장을 해소하는 방어기제입니다.", "상황의 아이러니나 모순을 포착해 가볍게 만드는 능력입니다."],
+          ["예를 들어, 면접에서 떨어진 후 \"면접관이 내 잠재력을 감당 못 한 거지\"라고 농담하거나,", "힘든 상황에서 자기 비하적인 유머로 분위기를 풀어가는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "억제", en: "Suppression", mature: true,
+        lines: [
+          ["억제는 불편한 생각이나 감정을 의식적으로 일시적으로 미뤄두는 방어기제입니다.", "억압(Repression)과 달리 의식적인 선택이라는 점이 핵심입니다."],
+          ["예를 들어, 중요한 회의 중에 개인적인 걱정이 떠올랐을 때", "\"지금은 이 생각을 잠시 접어두고, 회의 끝나고 생각하자\"라고 결정하는 것이 억제입니다."],
+        ],
+      },
+      {
+        ko: "예상", en: "Anticipation", mature: true,
+        lines: [
+          ["예상은 미래에 일어날 수 있는 어려움이나 스트레스를 미리 생각하고 현실적으로 대비하는 방어기제입니다.", "걱정과 다른 점은 실제적인 준비와 계획으로 이어진다는 것입니다."],
+          ["예를 들어, 중요한 프레젠테이션 전에 예상 질문을 정리하고 답변을 준비하거나,", "어려운 대화를 앞두고 여러 시나리오를 생각해보는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "이타주의", en: "Altruism", mature: true,
+        lines: [
+          ["이타주의는 자신의 내적 갈등이나 스트레스를 타인을 돕는 행위를 통해 해소하는 방어기제입니다.", "남을 도우면서 자신도 심리적 만족과 의미를 얻습니다."],
+          ["예를 들어, 본인이 어린 시절 힘들었던 경험을 바탕으로 어려운 아이들을 돕는 봉사활동을 하거나,", "자신의 질병 경험을 같은 환자들을 위한 지지 활동으로 전환하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "합리화", en: "Rationalization", mature: false,
+        lines: [
+          ["합리화는 받아들이기 어려운 행동이나 감정에 대해 그럴듯한 이유를 만들어내는 방어기제입니다.", "진짜 동기를 숨기고 논리적으로 보이는 설명을 제시합니다."],
+          ["예를 들어, 원하던 회사에 떨어지고 \"사실 그 회사 워라밸이 안 좋다더라\"라고 말하거나,", "충동구매 후 \"어차피 필요한 거였어\"라고 정당화하는 것이 해당됩니다. 이솝우화의 '신 포도' 이야기가 합리화의 대표적인 예입니다."],
+        ],
+      },
+      {
+        ko: "주지화", en: "Intellectualization", mature: false,
+        lines: [
+          ["주지화는 감정적으로 힘든 상황을 감정과 분리해서 순수하게 지적이고", "추상적인 방식으로 다루는 방어기제입니다. 느끼는 대신 분석합니다."],
+          ["예를 들어, 이별 후 슬픔을 느끼는 대신 \"관계의 역학 관계\"에 대해 분석하거나,", "심각한 병 진단을 받고 감정을 느끼기보다 의학 정보를 열심히 찾아보는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "보상", en: "Compensation", mature: false,
+        lines: [
+          ["보상은 한 영역에서의 부족함이나 열등감을 다른 영역에서의 성취로", "메우려는 방어기제입니다. 약점을 강점으로 상쇄하려고 합니다."],
+          ["예를 들어, 외모에 자신이 없는 사람이 지적 능력을 키우는 데 집중하거나,", "운동 능력이 부족한 사람이 예술 분야에서 두각을 나타내려고 노력하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "동일시", en: "Identification", mature: false,
+        lines: [
+          ["동일시는 자신이 존경하거나 부러워하는 대상의 특성, 태도, 행동을", "자신의 것으로 받아들이는 방어기제입니다. 그 대상처럼 되려고 함으로써 자존감을 높입니다."],
+          ["예를 들어, 존경하는 선배의 말투와 스타일을 따라 하거나,", "좋아하는 연예인의 패션과 행동을 모방하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "억압", en: "Repression", mature: false,
+        lines: [
+          ["억압은 받아들이기 힘든 생각, 기억, 욕구를 무의식 속으로 밀어내어", "의식하지 못하게 하는 방어기제입니다. 가장 기본적인 방어기제로, 다른 많은 방어기제의 토대가 됩니다."],
+          ["예를 들어, 어린 시절 트라우마를 전혀 기억하지 못하거나,", "특정 사건에 대한 기억이 완전히 사라진 것처럼 느껴지는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "격리", en: "Isolation", mature: false,
+        lines: [
+          ["격리는 어떤 생각이나 기억에서 그와 연결된 감정을 분리해내는 방어기제입니다.", "사실은 기억하지만, 그에 따른 감정은 느끼지 않습니다."],
+          ["예를 들어, 트라우마 경험을 마치 남의 일처럼 담담하게 이야기하거나,", "충격적인 사건에 대해 감정 없이 사실만 나열하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "반동형성", en: "Reaction Formation", mature: false,
+        lines: [
+          ["반동형성은 받아들이기 힘든 충동이나 욕구를 정반대의 태도나 행동으로", "바꿔 표현하는 방어기제입니다. 진짜 감정의 반대로 행동합니다."],
+          ["예를 들어, 누군가를 싫어하면서 오히려 과도하게 친절하게 대하거나,", "성적 욕구에 죄책감을 느끼는 사람이 극단적으로 금욕적인 태도를 보이는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "전치", en: "Displacement", mature: false,
+        lines: [
+          ["전치는 특정 대상에 대한 감정을 직접 표현하지 못하고, 덜 위협적인", "다른 대상에게 옮겨서 표현하는 방어기제입니다. 감정의 방향을 바꿉니다."],
+          ["예를 들어, 직장 상사에게 화가 났지만 표현하지 못하고 집에 와서 가족에게 짜증을 내는 것,", "부모에게 받은 스트레스를 동생이나 반려동물에게 푸는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "부정", en: "Denial", mature: false,
+        lines: [
+          ["부정은 너무 고통스럽거나 위협적인 현실 자체를 인정하지 않는 방어기제입니다.", "명백한 사실 앞에서도 \"그런 일은 없다\"고 믿습니다."],
+          ["예를 들어, 심각한 병 진단을 받고도 \"의사가 틀렸을 거야\"라고 생각하거나,", "관계가 끝났다는 명백한 신호를 무시하고 \"잠깐 힘든 시기일 뿐이야\"라고 믿는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "투사", en: "Projection", mature: false,
+        lines: [
+          ["투사는 자신의 받아들이기 힘든 감정, 욕구, 특성을 타인에게 있는", "것으로 돌리는 방어기제입니다. 내 안의 것을 남의 것으로 봅니다."],
+          ["예를 들어, 자신이 상대방에게 화가 났으면서 \"저 사람이 나한테 화났어\"라고 느끼거나,", "자신의 불성실함을 인정하지 못하고 다른 사람들이 불성실하다고 비난하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "퇴행", en: "Regression", mature: false,
+        lines: [
+          ["퇴행은 스트레스 상황에서 이전 발달 단계의 행동이나 사고방식으로", "돌아가는 방어기제입니다. 어린 시절의 방식으로 퇴보합니다."],
+          ["예를 들어, 스트레스를 받으면 손톱을 물어뜯거나 과식을 하는 것,", "어른이 큰 스트레스를 받고 어린아이처럼 울거나 의존적으로 변하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "행동화", en: "Acting Out", mature: false,
+        lines: [
+          ["행동화는 무의식적인 감정이나 충동을 말이나 생각으로 표현하는 대신", "즉각적인 행동으로 표출하는 방어기제입니다. 느끼고 생각하는 대신 행동합니다."],
+          ["예를 들어, 화가 났을 때 대화로 해결하려 하지 않고 물건을 던지거나 문을 쾅 닫는 것,", "불안할 때 충동적으로 쇼핑을 하거나 과음을 하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "수동공격", en: "Passive Aggression", mature: false,
+        lines: [
+          ["수동공격은 분노나 불만을 직접적으로 표현하지 않고, 간접적이고 소극적인", "방식으로 표출하는 방어기제입니다. 겉으로는 순응하면서 속으로는 저항합니다."],
+          ["예를 들어, 요청받은 일을 의도적으로 늦게 하거나 \"잊어버렸다\"고 하는 것,", "싫다고 말하지 않으면서 계속 핑계를 대며 피하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "흑백논리", en: "Splitting", mature: false,
+        lines: [
+          ["흑백논리는 자신과 타인, 상황을 전적으로 좋거나 전적으로 나쁜 것으로", "극단적으로 나누는 방어기제입니다. 중간 지대나 복잡성을 인정하지 않습니다."],
+          ["예를 들어, 어떤 사람을 처음에는 \"완벽한 사람\"으로 이상화했다가,", "실망하면 \"최악의 인간\"으로 평가절하하는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "해리", en: "Dissociation", mature: false,
+        lines: [
+          ["해리는 압도적인 스트레스나 트라우마 상황에서 의식, 기억, 정체감,", "환경 지각의 연결이 일시적으로 끊어지는 방어기제입니다. 현실에서 분리됩니다."],
+          ["예를 들어, 극심한 스트레스 상황에서 \"내가 내가 아닌 것 같다\"거나", "\"영화를 보는 것처럼 느껴진다\"는 경험이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "신체화", en: "Somatization", mature: false,
+        lines: [
+          ["신체화는 심리적 갈등이나 스트레스가 신체 증상으로 표현되는 방어기제입니다.", "마음의 고통이 몸의 고통으로 전환됩니다."],
+          ["예를 들어, 스트레스를 받으면 두통이나 소화불량이 생기는 것,", "불안할 때 가슴이 답답하거나 숨이 가빠지는 것이 해당됩니다."],
+        ],
+      },
+      {
+        ko: "공상", en: "Fantasy", mature: false,
+        lines: [
+          ["공상은 현실의 문제나 불만족을 상상 속에서 해결하거나", "충족시키는 방어기제입니다. 현실 대신 상상의 세계에 머뭅니다."],
+          ["예를 들어, 직장에서 힘든 일이 있을 때 복권에 당첨되어 회사를 그만두는", "상상을 하거나, 외로울 때 이상적인 연인과의 관계를 상상하는 것이 해당됩니다."],
+        ],
+      },
+    ];
+    const FINGERS = [
+      { joints: [2, 3, 4], press: [3, 4] },
+      { joints: [5, 6, 7, 8], press: [6, 7, 8] },
+      { joints: [9, 10, 11, 12], press: [10, 11, 12] },
+      { joints: [13, 14, 15, 16], press: [14, 15, 16] },
+      { joints: [17, 18, 19, 20], press: [18, 19, 20] },
+    ];
+    const PALM_INDICES = [0, 5, 9, 13, 17];
+    const OPPOSING_TIPS = [8, 12, 16, 20];
+
+    const stage = document.querySelector("#stage");
+    const video = document.querySelector("#webcam");
+    const canvas = document.querySelector("#view");
+    const statusEl = document.querySelector("#status");
+    const prevButton = document.querySelector("#prev-squishy");
+    const nextButton = document.querySelector("#next-squishy");
+    const arrowLatch = { prev: false, next: false };
+    const ctx = canvas.getContext("2d", { alpha: false });
+
+    const angles = Array.from({ length: POINT_COUNT }, (_, index) => (index / POINT_COUNT) * Math.PI * 2);
+    const radii = new Array(POINT_COUNT).fill(0);
+    const velocities = new Array(POINT_COUNT).fill(0);
+
+    let viewWidth = 0;
+    let viewHeight = 0;
+    let restRadius = 0;
+    let landmarker = null;
+    let cameraReady = false;
+    let lastResults = null;
+    let gripPressure = 0;
+    let carousel = 0;
+    let targetCarousel = 0;
+    let activeDents = [];
+    let activeBulges = [];
+    let lastDetectTime = -1;
+    let detectErrorLogged = false;
+    let lastFrame = performance.now();
+    function loadImage(src) {
+      const image = new Image();
+      image.src = src;
+      return image;
+    }
+
+    const matureButton = loadImage(encodeURI("버튼.png"));
+    const immatureButton = loadImage(encodeURI("버튼-1.png"));
+
+    const grain = document.createElement("canvas");
+    grain.width = 160;
+    grain.height = 160;
+    {
+      const grainCtx = grain.getContext("2d");
+      const pixels = grainCtx.createImageData(grain.width, grain.height);
+      for (let i = 0; i < pixels.data.length; i += 4) {
+        const shade = 128 + Math.random() * 28;
+        pixels.data[i] = shade;
+        pixels.data[i + 1] = shade;
+        pixels.data[i + 2] = shade;
+        pixels.data[i + 3] = 255;
+      }
+      grainCtx.putImageData(pixels, 0, 0);
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+
+    function mod(value, count) {
+      return ((value % count) + count) % count;
+    }
+
+    function lerp(from, to, t) {
+      return from + (to - from) * t;
+    }
+
+    function dist(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y);
+    }
+
+    function dist3(a, b) {
+      return Math.hypot(a.x - b.x, a.y - b.y, (a.z || 0) - (b.z || 0));
+    }
+
+    function angleDelta(a, b) {
+      let delta = a - b;
+      while (delta > Math.PI) delta -= Math.PI * 2;
+      while (delta < -Math.PI) delta += Math.PI * 2;
+      return delta;
+    }
+
+    function average(points) {
+      let x = 0;
+      let y = 0;
+      let z = 0;
+      for (const point of points) {
+        x += point.x;
+        y += point.y;
+        z += point.z || 0;
+      }
+      const count = points.length || 1;
+      return { x: x / count, y: y / count, z: z / count };
+    }
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+      statusEl.classList.toggle("is-hidden", !message);
+    }
+
+    function resize() {
+      const rect = stage.getBoundingClientRect();
+      const nextWidth = rect.width;
+      const nextHeight = rect.height;
+      if (nextWidth < 2 || nextHeight < 2) return;
+      if (
+        Math.abs(nextWidth - viewWidth) < 0.5 &&
+        Math.abs(nextHeight - viewHeight) < 0.5 &&
+        canvas.width > 0
+      ) {
+        return;
+      }
+
+      viewWidth = nextWidth;
+      viewHeight = nextHeight;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      canvas.width = Math.round(viewWidth * dpr);
+      canvas.height = Math.round(viewHeight * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const nextRest = Math.min(viewWidth, viewHeight) * 0.2;
+      if (restRadius > 0) {
+        const scale = nextRest / restRadius;
+        for (let i = 0; i < POINT_COUNT; i += 1) radii[i] *= scale;
+      } else {
+        radii.fill(nextRest);
+      }
+      restRadius = nextRest;
+    }
+
+    function coverSource(videoWidth, videoHeight, width, height) {
+      const videoAspect = videoWidth / videoHeight;
+      const viewAspect = width / height;
+      if (videoAspect > viewAspect) {
+        const sw = videoHeight * viewAspect;
+        return { sx: (videoWidth - sw) / 2, sy: 0, sw, sh: videoHeight };
+      }
+      const sh = videoWidth / viewAspect;
+      return { sx: 0, sy: (videoHeight - sh) / 2, sw: videoWidth, sh };
+    }
+
+    function landmarkToView(landmark, frame) {
+      const nx = (landmark.x * video.videoWidth - frame.sx) / frame.sw;
+      const ny = (landmark.y * video.videoHeight - frame.sy) / frame.sh;
+      return {
+        x: viewWidth * (1 - nx),
+        y: viewHeight * ny,
+        z: landmark.z || 0,
+      };
+    }
+
+    function fingerCurl(points, joints) {
+      let chain = 0;
+      for (let i = 0; i < joints.length - 1; i += 1) {
+        chain += dist(points[joints[i]], points[joints[i + 1]]);
+      }
+      const span = dist(points[joints[0]], points[joints[joints.length - 1]]);
+      const straight = span / (chain + 1e-6);
+      return clamp((0.98 - straight) / 0.55, 0, 1);
+    }
+
+    function gaussian(delta, sigma) {
+      return Math.exp(-(delta * delta) / (2 * sigma * sigma));
+    }
+
+    function smoothClosed(values, amount) {
+      const next = new Array(values.length);
+      const keep = 1 - amount;
+      for (let i = 0; i < values.length; i += 1) {
+        const prev = values[(i - 1 + values.length) % values.length];
+        const following = values[(i + 1) % values.length];
+        next[i] = values[i] * keep + (prev + following) * (amount / 2);
+      }
+      return next;
+    }
+
+    function analyzeHand(imageLandmarks, worldLandmarks, frame) {
+      const points = imageLandmarks.map((landmark) => landmarkToView(landmark, frame));
+      const center = { x: viewWidth / 2, y: rowCenterY() };
+      const palm = average(PALM_INDICES.map((index) => points[index]));
+      const thumb = points[4];
+      const opposing = OPPOSING_TIPS.map((index) => points[index]);
+      const palmDistance = dist(palm, center);
+      const nearTips = [thumb, ...opposing].filter((point) => dist(point, center) < restRadius * 1.75).length;
+      const palmOnBall = palmDistance < restRadius * 1.25;
+      const grabbing = palmOnBall || (palmDistance < restRadius * 2.2 && nearTips >= 2);
+
+      const handScale = Math.max(dist(points[0], points[9]), 1);
+      const imageGaps = opposing.map((point) => dist(thumb, point)).sort((a, b) => a - b);
+      const imageAperture = (imageGaps[0] + imageGaps[1]) / 2;
+      const openAperture = handScale * 1.45;
+      const closedAperture = handScale * 0.28;
+      const imageClosure = clamp(
+        (openAperture - imageAperture) / (openAperture - closedAperture),
+        0,
+        1,
+      );
+
+      let worldClosure = imageClosure;
+      if (worldLandmarks && worldLandmarks.length >= 21) {
+        const worldGaps = OPPOSING_TIPS
+          .map((index) => dist3(worldLandmarks[4], worldLandmarks[index]))
+          .sort((a, b) => a - b);
+        const worldAperture = (worldGaps[0] + worldGaps[1]) / 2;
+        worldClosure = clamp((0.155 - worldAperture) / (0.155 - 0.045), 0, 1);
+      }
+
+      let closure = clamp(worldClosure * 0.55 + imageClosure * 0.45, 0, 1);
+      if (grabbing) {
+        const tipZ = average([points[4], points[8], points[12], points[16], points[20]]).z;
+        const depth = clamp((points[0].z - tipZ) / 0.1, 0, 1);
+        closure = clamp(closure * 0.82 + depth * 0.18, 0, 1);
+      }
+
+      const pressure = grabbing ? closure : 0;
+      const dents = [];
+      const bulges = [];
+      const fingerMarks = [];
+      if (pressure < 0.12) {
+        return { grabbing, pressure, dents, bulges };
+      }
+
+      for (const finger of FINGERS) {
+        const curl = fingerCurl(points, finger.joints);
+        const samples = finger.press.map((index) => {
+          const point = points[index];
+          return {
+            x: point.x,
+            y: point.y,
+            distance: dist(point, center),
+            angle: Math.atan2(point.y - center.y, point.x - center.x),
+          };
+        });
+        const nearest = samples.reduce((best, sample) => (
+          sample.distance < best.distance ? sample : best
+        ));
+        const proximity = clamp((restRadius * 1.5 - nearest.distance) / (restRadius * 0.9), 0, 1);
+        if (proximity < 0.12 || curl < 0.18) continue;
+
+        const fingerPress = clamp((curl * 0.72 + proximity * 0.5) * (0.2 + 0.8 * pressure), 0, 1);
+        if (fingerPress < 0.14) continue;
+        fingerMarks.push({ angle: nearest.angle, press: fingerPress });
+
+        const pressing = [];
+        for (const sample of samples) {
+          const near = clamp((restRadius * 1.4 - sample.distance) / (restRadius * 0.75), 0, 1);
+          const samplePress = fingerPress * (0.42 + 0.58 * Math.max(near, curl * 0.75));
+          if (samplePress < 0.12) continue;
+          dents.push({
+            angle: sample.angle,
+            press: samplePress,
+            sigma: 0.19,
+            x: sample.x,
+            y: sample.y,
+          });
+          pressing.push(sample);
+        }
+
+        for (let i = 0; i < pressing.length - 1; i += 1) {
+          const step = angleDelta(pressing[i + 1].angle, pressing[i].angle);
+          const gap = Math.abs(step);
+          if (gap < 0.11 || gap > 0.78) continue;
+          bulges.push({
+            angle: pressing[i].angle + step / 2,
+            press: fingerPress * 0.82,
+            sigma: clamp(gap * 0.34, 0.11, 0.24),
+          });
+        }
+      }
+
+      if (fingerMarks.length >= 2) {
+        const ordered = fingerMarks.slice().sort((a, b) => a.angle - b.angle);
+        for (let i = 0; i < ordered.length; i += 1) {
+          const current = ordered[i];
+          const next = ordered[(i + 1) % ordered.length];
+          let gap = next.angle - current.angle;
+          if (gap < 0) gap += Math.PI * 2;
+          if (gap < 0.22 || gap > 1.15) continue;
+          bulges.push({
+            angle: current.angle + gap / 2,
+            press: Math.min(current.press, next.press),
+            sigma: clamp(gap * 0.24, 0.13, 0.3),
+          });
+        }
+      }
+
+      return { grabbing, pressure, dents, bulges };
+    }
+
+    function buildTargets(dents, bulges, pressure) {
+      const targets = new Array(POINT_COUNT);
+      const squeeze = 1 - 0.07 * pressure;
+
+      for (let i = 0; i < POINT_COUNT; i += 1) {
+        let dent = 0;
+        let bulge = 0;
+        for (const mark of dents) {
+          const weight = gaussian(angleDelta(angles[i], mark.angle), mark.sigma);
+          if (weight < 0.04) continue;
+          dent += mark.press * weight;
+        }
+        for (const mark of bulges) {
+          const weight = gaussian(angleDelta(angles[i], mark.angle), mark.sigma);
+          if (weight < 0.04) continue;
+          bulge += mark.press * weight;
+        }
+        const inward = Math.min(0.34, dent * 0.36);
+        const outward = Math.min(0.18, bulge * 0.22);
+        targets[i] = clamp(restRadius * squeeze * (1 - inward) * (1 + outward), restRadius * 0.58, restRadius * 1.28);
+      }
+
+      return smoothClosed(targets, 0.16);
+    }
+
+    function integrate(targets, dt) {
+      const stiffness = 46;
+      const damping = 15;
+      for (let i = 0; i < POINT_COUNT; i += 1) {
+        const acceleration = (targets[i] - radii[i]) * stiffness - velocities[i] * damping;
+        velocities[i] = clamp(velocities[i] + acceleration * dt, -restRadius * 3, restRadius * 3);
+        radii[i] += velocities[i] * dt;
+      }
+    }
+
+    function blobPoints(cx, cy, scale, deformWeight) {
+      const points = new Array(POINT_COUNT);
+      for (let i = 0; i < POINT_COUNT; i += 1) {
+        const radius = lerp(restRadius, radii[i], deformWeight) * scale;
+        points[i] = {
+          x: cx + Math.cos(angles[i]) * radius,
+          y: cy + Math.sin(angles[i]) * radius,
+        };
+      }
+      return points;
+    }
+
+    function traceSmooth(points) {
+      const count = points.length;
+      ctx.beginPath();
+      ctx.moveTo(points[0].x, points[0].y);
+      for (let i = 0; i < count; i += 1) {
+        const p0 = points[(i - 1 + count) % count];
+        const p1 = points[i];
+        const p2 = points[(i + 1) % count];
+        const p3 = points[(i + 2) % count];
+        const cp1x = p1.x + (p2.x - p0.x) / 8;
+        const cp1y = p1.y + (p2.y - p0.y) / 8;
+        const cp2x = p2.x - (p3.x - p1.x) / 8;
+        const cp2y = p2.y - (p3.y - p1.y) / 8;
+        ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+      }
+      ctx.closePath();
+    }
+
+    function drawVideo() {
+      if (!cameraReady || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+        ctx.fillStyle = "#101113";
+        ctx.fillRect(0, 0, viewWidth, viewHeight);
+        return null;
+      }
+      const frame = coverSource(video.videoWidth, video.videoHeight, viewWidth, viewHeight);
+      ctx.save();
+      ctx.translate(viewWidth, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, frame.sx, frame.sy, frame.sw, frame.sh, 0, 0, viewWidth, viewHeight);
+      ctx.restore();
+      return frame;
+    }
+
+    function drawSquishy(points, dents, bulges, cx, cy, scale, alpha) {
+      const radius = restRadius * scale;
+      const lightX = cx - radius * 0.28;
+      const lightY = cy - radius * 0.34;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+
+      ctx.save();
+      ctx.shadowColor = "rgba(40, 40, 48, 0.32)";
+      ctx.shadowBlur = Math.max(22, radius * 0.5);
+      ctx.shadowOffsetY = radius * 0.1;
+      traceSmooth(points);
+      const fill = ctx.createRadialGradient(lightX, lightY, radius * 0.02, cx, cy + radius * 0.12, radius * 1.2);
+      fill.addColorStop(0, "#ffffff");
+      fill.addColorStop(0.34, "#f8f8f8");
+      fill.addColorStop(0.68, "#efeff1");
+      fill.addColorStop(1, "#e0e0e4");
+      ctx.fillStyle = fill;
+      ctx.fill();
+      ctx.restore();
+
+      ctx.save();
+      traceSmooth(points);
+      ctx.clip();
+
+      const bodyShade = ctx.createLinearGradient(cx, cy - radius, cx, cy + radius * 1.05);
+      bodyShade.addColorStop(0, "rgba(255, 255, 255, 0.4)");
+      bodyShade.addColorStop(0.42, "rgba(255, 255, 255, 0)");
+      bodyShade.addColorStop(1, "rgba(150, 150, 158, 0.26)");
+      ctx.fillStyle = bodyShade;
+      ctx.fillRect(0, 0, viewWidth, viewHeight);
+
+      for (const dent of dents) {
+        const reach = radius * (0.7 + 0.35 * dent.press);
+        const shade = ctx.createRadialGradient(dent.x, dent.y, 0, dent.x, dent.y, reach);
+        const alpha = 0.16 * dent.press;
+        shade.addColorStop(0, `rgba(168, 168, 176, ${alpha})`);
+        shade.addColorStop(1, "rgba(168, 168, 176, 0)");
+        ctx.fillStyle = shade;
+        ctx.fillRect(0, 0, viewWidth, viewHeight);
+      }
+
+      for (const bulge of bulges) {
+        const bx = cx + Math.cos(bulge.angle) * radius * 0.78;
+        const by = cy + Math.sin(bulge.angle) * radius * 0.78;
+        const reach = radius * (0.34 + bulge.sigma);
+        const light = ctx.createRadialGradient(bx, by, 0, bx, by, reach);
+        const alpha = 0.22 * bulge.press;
+        light.addColorStop(0, `rgba(255, 255, 255, ${alpha})`);
+        light.addColorStop(1, "rgba(255, 255, 255, 0)");
+        ctx.fillStyle = light;
+        ctx.fillRect(0, 0, viewWidth, viewHeight);
+      }
+
+      const highlight = ctx.createRadialGradient(lightX, lightY, radius * 0.05, lightX, lightY, radius * 1.05);
+      highlight.addColorStop(0, "rgba(255, 255, 255, 0.42)");
+      highlight.addColorStop(0.55, "rgba(255, 255, 255, 0.08)");
+      highlight.addColorStop(1, "rgba(255, 255, 255, 0)");
+      ctx.fillStyle = highlight;
+      ctx.fillRect(0, 0, viewWidth, viewHeight);
+
+      ctx.save();
+      ctx.globalAlpha = 0.09 * alpha;
+      ctx.globalCompositeOperation = "soft-light";
+      const pattern = ctx.createPattern(grain, "repeat");
+      ctx.fillStyle = pattern;
+      ctx.fillRect(0, 0, viewWidth, viewHeight);
+      ctx.restore();
+
+      ctx.restore();
+      ctx.restore();
+    }
+
+    function fitFontSize(text, weight, family, preferred, maxWidth, minSize) {
+      let size = preferred;
+      ctx.font = `${weight} ${size}px ${family}, sans-serif`;
+      while (size > minSize && ctx.measureText(text).width > maxWidth) size -= 0.5;
+      return size;
+    }
+
+    function drawLabel(index, cx, cy, scale, alpha) {
+      const defense = DEFENSES[index];
+      const radius = restRadius * scale;
+      const maxWidth = viewWidth * 0.25;
+      const sizeScale = 0.68 + 0.32 * scale;
+      const koSize = fitFontSize(
+        defense.ko,
+        700,
+        KO_FONT,
+        clamp(restRadius * 0.2 * sizeScale, 17, 44),
+        maxWidth,
+        14,
+      );
+      const enSize = fitFontSize(
+        defense.en,
+        500,
+        EN_FONT,
+        clamp(restRadius * 0.078 * sizeScale, 9, 17),
+        maxWidth,
+        8,
+      );
+      const buttonHeight = clamp(restRadius * 0.2 * sizeScale, 16, 38);
+      const buttonWidth = Math.min(maxWidth, buttonHeight * 2);
+      const gapName = Math.max(3, koSize * 0.16);
+      const gapButton = Math.max(5, enSize * 0.7);
+      const gapBlob = Math.max(7, radius * 0.09);
+      const lift = Math.min(viewHeight * 0.032, 26);
+      const buttonTop = cy - radius - gapBlob - buttonHeight - lift;
+      const enBaseline = buttonTop - gapButton;
+      const koBaseline = enBaseline - enSize * 0.92 - gapName;
+
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.shadowColor = "transparent";
+      ctx.font = `700 ${koSize}px ${KO_FONT}, sans-serif`;
+      ctx.fillText(defense.ko, cx, koBaseline);
+      ctx.font = `500 ${enSize}px ${EN_FONT}, sans-serif`;
+      ctx.fillText(defense.en, cx, enBaseline);
+      const image = defense.mature ? matureButton : immatureButton;
+      if (image.complete && image.naturalWidth > 0) {
+        ctx.drawImage(image, cx - buttonWidth / 2, buttonTop, buttonWidth, buttonHeight);
+      }
+      ctx.restore();
+    }
+
+    function drawDescription(index, cx, blobBottom, alpha) {
+      const blocks = DEFENSES[index].lines;
+      const lines = blocks.flat();
+      const maxWidth = viewWidth * 0.86;
+      const captionTop = viewHeight - 72;
+      const top = blobBottom + Math.max(16, restRadius * 0.1);
+      const available = captionTop - top;
+      if (available < 40 || alpha < 0.04) return;
+
+      let size = clamp(Math.min(viewWidth, viewHeight) * 0.02, 12, 22);
+      const lineWidth = (line, fontSize) => {
+        ctx.font = `400 ${fontSize}px ${KO_FONT}, sans-serif`;
+        return Math.max(ctx.measureText(line).width, line.length * fontSize * 0.98);
+      };
+      const fit = () => {
+        const widest = Math.max(...lines.map((line) => lineWidth(line, size)));
+        const blockHeight = size * 1.38 * 4 + size * 1.25;
+        return widest <= maxWidth && blockHeight <= available;
+      };
+      while (size > 8 && !fit()) size -= 0.5;
+      if (!fit()) return;
+      size *= 0.75;
+
+      const lineHeight = size * 1.38;
+      const paragraphGap = size * 1.25;
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.fillStyle = "#fff";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.shadowColor = "transparent";
+      ctx.font = `400 ${size}px ${KO_FONT}, sans-serif`;
+      let y = top;
+      blocks.forEach((paragraph, paragraphIndex) => {
+        paragraph.forEach((line) => {
+          ctx.fillText(line, cx, y);
+          y += lineHeight;
+        });
+        if (paragraphIndex === 0) y += paragraphGap;
+      });
+      ctx.restore();
+    }
+
+    function rowRise() {
+      return Math.min(viewHeight * 0.07, 90);
+    }
+
+    function rowCenterY() {
+      const topClear = 24;
+      const ko = clamp(restRadius * 0.2, 17, 44);
+      const en = clamp(restRadius * 0.078, 9, 17);
+      const button = clamp(restRadius * 0.2, 16, 38);
+      const lift = Math.min(viewHeight * 0.032, 26);
+      const drop = Math.min(viewHeight * 0.042, 34);
+      const stack = ko
+        + en * 1.62
+        + button
+        + lift
+        + Math.max(3, ko * 0.16)
+        + Math.max(5, en * 0.7)
+        + Math.max(7, restRadius * 0.09);
+      const needed = topClear + stack + restRadius;
+      const aboveCaption = viewHeight - 36 - restRadius;
+      return clamp(Math.max(viewHeight / 2, needed) + drop - rowRise(), restRadius * 1.05, aboveCaption);
+    }
+
+    function drawCarousel() {
+      const spacing = viewWidth * 0.29;
+      const anchor = Math.floor(carousel);
+      const drawn = [];
+      const cy = rowCenterY();
+      prevButton.style.top = `${cy}px`;
+      nextButton.style.top = `${cy}px`;
+
+      for (let delta = -1; delta <= 2; delta += 1) {
+        const itemPos = anchor + delta;
+        const offset = itemPos - carousel;
+        const distance = Math.abs(offset);
+        if (distance > 1.55) continue;
+        const presence = distance <= 1 ? 1 : clamp((1.55 - distance) / 0.55, 0, 1);
+        if (presence <= 0.02) continue;
+        const side = clamp(distance, 0, 1);
+        drawn.push({
+          index: mod(itemPos, SQUISHY_COUNT),
+          cx: viewWidth / 2 + offset * spacing,
+          cy,
+          scale: lerp(1, 0.56, side),
+          alpha: lerp(1, 0.4, side) * presence,
+          labelAlpha: lerp(1, 0.78, side) * presence,
+          deform: clamp(1 - distance / 0.55, 0, 1),
+          distance,
+          presence,
+        });
+      }
+
+      drawn.sort((a, b) => b.distance - a.distance);
+      for (const item of drawn) {
+        const gripped = item.deform > 0.72;
+        drawSquishy(
+          blobPoints(item.cx, item.cy, item.scale, item.deform),
+          gripped ? activeDents : [],
+          gripped ? activeBulges : [],
+          item.cx,
+          item.cy,
+          item.scale,
+          item.alpha,
+        );
+      }
+      for (const item of drawn) {
+        drawLabel(item.index, item.cx, item.cy, item.scale, item.labelAlpha);
+      }
+      const focus = drawn.reduce((closest, item) => (
+        item.distance < closest.distance ? item : closest
+      ));
+      if (focus) {
+        const readable = clamp(1 - focus.distance / 0.55, 0, 1);
+        drawDescription(
+          focus.index,
+          viewWidth / 2,
+          focus.cy + restRadius * focus.scale + rowRise(),
+          readable,
+        );
+      }
+    }
+
+    const FINGERTIPS = [4, 8, 12, 16, 20];
+
+    function buttonRect(button, pad) {
+      const stageRect = stage.getBoundingClientRect();
+      const rect = button.getBoundingClientRect();
+      return {
+        left: rect.left - stageRect.left - pad,
+        top: rect.top - stageRect.top - pad,
+        right: rect.right - stageRect.left + pad,
+        bottom: rect.bottom - stageRect.top + pad,
+      };
+    }
+
+    function containsPoint(rect, point) {
+      return point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom;
+    }
+
+    function touchArrows(frame) {
+      const hitPad = Math.max(16, Math.min(viewWidth, viewHeight) * 0.028);
+      const releasePad = hitPad + 26;
+      const zones = {
+        prev: {
+          button: prevButton,
+          hit: buttonRect(prevButton, hitPad),
+          release: buttonRect(prevButton, releasePad),
+        },
+        next: {
+          button: nextButton,
+          hit: buttonRect(nextButton, hitPad),
+          release: buttonRect(nextButton, releasePad),
+        },
+      };
+      const inside = { prev: false, next: false };
+      const held = { prev: false, next: false };
+
+      if (frame && lastResults?.landmarks) {
+        for (const landmarks of lastResults.landmarks) {
+          if (!landmarks || landmarks.length < 21) continue;
+          const tip = landmarkToView(landmarks[8], frame);
+          for (const key of ["prev", "next"]) {
+            if (containsPoint(zones[key].hit, tip)) inside[key] = true;
+            if (containsPoint(zones[key].release, tip)) held[key] = true;
+          }
+        }
+      }
+
+      for (const key of ["prev", "next"]) {
+        if (inside[key] && !arrowLatch[key]) {
+          targetCarousel += key === "next" ? 1 : -1;
+          arrowLatch[key] = true;
+        } else if (!held[key]) {
+          arrowLatch[key] = false;
+        }
+        zones[key].button.classList.toggle("is-touched", inside[key]);
+      }
+    }
+
+    function drawHands(frame) {
+      if (!lastResults || !frame) return;
+      const unit = Math.min(viewWidth, viewHeight) / 720;
+      const radius = 9 * unit;
+      ctx.save();
+      ctx.filter = `blur(${Math.max(2, 3.2 * unit)}px)`;
+      ctx.fillStyle = "rgba(255, 255, 255, 0.275)";
+      for (const landmarks of lastResults.landmarks || []) {
+        if (!landmarks || landmarks.length < 21) continue;
+        for (const index of FINGERTIPS) {
+          const point = landmarkToView(landmarks[index], frame);
+          ctx.beginPath();
+          ctx.arc(point.x, point.y, radius, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      ctx.restore();
+    }
+
+    function detectHands(now) {
+      if (!cameraReady || !landmarker || video.readyState < 2 || !video.videoWidth) return;
+      const timestamp = now <= lastDetectTime ? lastDetectTime + 1 : now;
+      lastDetectTime = timestamp;
+      try {
+        lastResults = landmarker.detectForVideo(video, timestamp);
+        detectErrorLogged = false;
+      } catch (error) {
+        if (!detectErrorLogged) {
+          console.error(error);
+          detectErrorLogged = true;
+        }
+      }
+    }
+
+    function loop(now) {
+      try {
+        const dt = clamp((now - lastFrame) / 1000, 0, 0.033);
+        lastFrame = now;
+        if (restRadius >= 1 && viewWidth >= 2) {
+          detectHands(now);
+          const frame = cameraReady && video.videoWidth
+            ? coverSource(video.videoWidth, video.videoHeight, viewWidth, viewHeight)
+            : null;
+
+          let targetPressure = 0;
+          const dents = [];
+          const bulges = [];
+
+          if (frame && lastResults?.landmarks?.length) {
+            const worlds = lastResults.worldLandmarks || [];
+            for (let i = 0; i < lastResults.landmarks.length; i += 1) {
+              const hand = analyzeHand(lastResults.landmarks[i], worlds[i], frame);
+              if (!hand.grabbing) continue;
+              targetPressure = Math.max(targetPressure, hand.pressure);
+              dents.push(...hand.dents);
+              bulges.push(...hand.bulges);
+            }
+          }
+
+          const follow = 1 - Math.exp(-dt * (targetPressure > gripPressure ? 7 : 3.2));
+          gripPressure += (targetPressure - gripPressure) * follow;
+
+          const shaped = gripPressure * gripPressure * (3 - 2 * gripPressure);
+          const targets = buildTargets(dents, bulges, shaped);
+          integrate(targets, dt);
+          activeDents = dents;
+          activeBulges = bulges;
+
+          touchArrows(frame);
+
+          carousel += (targetCarousel - carousel) * (1 - Math.exp(-dt * 10));
+          if (Math.abs(targetCarousel - carousel) < 0.0004) carousel = targetCarousel;
+
+          ctx.clearRect(0, 0, viewWidth, viewHeight);
+          const drawnFrame = drawVideo();
+          drawCarousel();
+          drawHands(drawnFrame);
+        }
+      } catch (error) {
+        console.error(error);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    async function createLandmarker() {
+      const vision = await FilesetResolver.forVisionTasks(WASM_ROOT);
+      const options = {
+        numHands: 2,
+        runningMode: "VIDEO",
+        minHandDetectionConfidence: 0.5,
+        minHandPresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+      };
+      try {
+        const gpuCanvas = document.createElement("canvas");
+        return await HandLandmarker.createFromOptions(vision, {
+          ...options,
+          canvas: gpuCanvas,
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" },
+        });
+      } catch (error) {
+        console.warn("GPU delegate를 쓸 수 없어 CPU로 다시 시도합니다.", error);
+        return HandLandmarker.createFromOptions(vision, {
+          ...options,
+          baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
+        });
+      }
+    }
+
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          facingMode: "user",
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          aspectRatio: { ideal: 16 / 9 },
+        },
+      });
+      video.srcObject = stream;
+      video.playsInline = true;
+      await video.play();
+      if (video.readyState < 2) {
+        await new Promise((resolve) => {
+          video.addEventListener("loadeddata", () => resolve(), { once: true });
+        });
+      }
+    }
+
+    prevButton.addEventListener("click", () => {
+      targetCarousel -= 1;
+    });
+    nextButton.addEventListener("click", () => {
+      targetCarousel += 1;
+    });
+
+    function loadNameFonts() {
+      return Promise.all([
+        document.fonts.load(`700 28px ${KO_FONT}`),
+        document.fonts.load(`500 16px ${EN_FONT}`),
+      ]).catch(() => {});
+    }
+
+    async function main() {
+      resize();
+      loadNameFonts();
+      new ResizeObserver(() => resize()).observe(stage);
+      requestAnimationFrame(loop);
+
+      if (location.protocol === "file:") {
+        setStatus("로컬 서버로 열어 주세요. 예: python3 -m http.server 4173");
+        return;
+      }
+
+      setStatus("손 랜드마크 모델을 불러오는 중…");
+      try {
+        landmarker = await createLandmarker();
+      } catch (error) {
+        console.error(error);
+        setStatus("모델을 불러오지 못했습니다. 인터넷 연결을 확인해 주세요.");
+        return;
+      }
+
+      setStatus("카메라 사용을 허용해 주세요");
+      try {
+        await startCamera();
+      } catch (error) {
+        console.error(error);
+        setStatus("카메라를 열 수 없습니다. 권한을 허용한 뒤 새로고침 해 주세요.");
+        return;
+      }
+
+      cameraReady = true;
+      setStatus("");
+    }
+
+    main();
+  </script>
+</body>
+</html>
